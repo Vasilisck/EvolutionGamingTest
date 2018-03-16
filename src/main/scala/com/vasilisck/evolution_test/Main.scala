@@ -14,8 +14,6 @@ object Main extends App {
     .set("spark.local.dir", "/tmp/spark-temp")
 
   val spark = SparkSession.builder.config(sparkConf).getOrCreate()
-  spark.sparkContext.hadoopConfiguration.set("mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
-  spark.sparkContext.hadoopConfiguration.set("parquet.enable.summary-metadata", "false")
 
 
   /** Specification of nginx logs:
@@ -39,19 +37,51 @@ object Main extends App {
     */
 
   import spark.implicits._
+  import org.apache.spark.sql.functions._
 
-  spark.read.textFile("nginx_logs")
+  //first implementation. We can you both repartition and  coalesce for it. Mapping happen on slaves nodes and after it
+  //all the data travel to master node.
+  val basicData = spark.read.textFile("nginx_logs")
     .map(parseNginxRecord)
+
+  basicData
     .coalesce(1)
     .write
     .mode(SaveMode.Overwrite)
     .format("json")
-    .save("./out/result_raw")
+    .save("./out/result_basic")
+  //result size is 12.09 MB which is bigger, that raw data. But we got a nice Json
 
-  spark.close()
+  //second version. Let's try only useful data (by my opinion) and save it with repartition
+  val liteData = basicData.map(nginxRecord =>
+    NginxRecordLite(nginxRecord.ipAddress, nginxRecord.date, nginxRecord.requestData, nginxRecord.responseCode, nginxRecord.userAgent))
+
+  liteData
+    .repartition(1)
+    .write
+    .mode(SaveMode.Overwrite)
+    .format("json")
+    .save("./out/result_lite")
+
+  //now let's write result data where partision will be done by IP address
+  val res = liteData.groupByKey(_.ipAddress)
+    .mapGroups { case (key, vs) =>
+        key -> vs.toList
+    }
+    .repartition(1)
+      .write
+      .mode(SaveMode.Overwrite)
+    .format("json")
+    .save("./out/result_partisioned")
+
+  println(res)
 
   val q = 0
-  //nginxLog.printSchema()
+  q
+
+
+
+  spark.close()
 
   def parseRequestData(requestData: String): RequestData = {
     val attrs = requestData.split(" ")
@@ -99,6 +129,11 @@ object Main extends App {
       userAgent)
   }
 
+  case class NginxRecordLite(ipAddress: String,
+                             date: Date,
+                             requestData: RequestData,
+                             responseCode: Option[Int],
+                             userAgent: Option[String])
 
   case class NginxRecord(ipAddress: String,
                          remoteLog: Option[String],
